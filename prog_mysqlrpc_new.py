@@ -243,8 +243,6 @@ class MysqlBASE(object):
         result=getattr(self,'_socket_default_timeout',None)
         return result
     ####################################
-    def get_acl(self):
-        raise
     def send(self,value=None):
         raise
     def recv(self,timeout=50,buf=1024):
