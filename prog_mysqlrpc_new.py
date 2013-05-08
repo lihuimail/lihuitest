@@ -29,11 +29,27 @@ MYSQL_CMD_QUIT  = '\x01' # MYSQL CMD QUIT
 MYSQL_CMD_PING  = '\x0e' # MYSQL CLIENT PING
 RESULT_OK_PACKET = '\x00\x00\x00\x02\x00\x00\x00'
 
+#db
 DB={
     'server_version':SERVER_VERSION.strip(),
     'frame_version':FRAME_VERSION,
     }
 
+def get_db():
+    global DB
+    return DB
+
+#wrap
+def wrap_timecall(func):
+    def wrap(*args):
+        d=get_db()
+        a=time.time()
+        result = func(*args)
+        d['func_'+func.__name__]=str((time.time()-a)*10000)
+        return result
+    return wrap
+
+###################
 class LogicError(Exception):
     def __init__(self, errno, errmsg):
         self.errno = errno
@@ -45,16 +61,20 @@ class LogicError(Exception):
     def __repr__(self):
         return "LogicError(%d,'%s')" % self.args
 
-def wrap_timecall(func):
-    def wrap(*args):
-        global DB
-        a=time.time()
-        result = func(*args)
-        DB['func_'+func.__name__]=str((time.time()-a)*10000)
-        return result
-    return wrap
-
 #mysql protocol
+def auth_check(password, sbuffer, cbuffer, dbname, client_option, max_packet_size):
+    try:
+        stage1 = hashlib.sha1(password).digest()
+        stage2 = hashlib.sha1(stage1).digest()
+        stage3 = hashlib.sha1(sbuffer+stage2).digest()
+        stage4 = ''.join(map(lambda (x, y): chr(ord(x) ^ ord(y)), zip(stage1, stage3)))
+        if stage4==cbuffer:
+            return True
+        else:
+            return False
+    except KeyError:
+        return False
+
 def get_encode_none():
     return '\xfb' # ascii=251 NULL
 
@@ -78,19 +98,6 @@ def get_encode_int(aint):
     else:
         aint1, aint2 = divmod(aint, 4294967296L)
         return '\xfe'+struct.pack("<II", aint2, aint1)
-
-def auth_check(password, sbuffer, cbuffer, dbname, client_option, max_packet_size):
-    try:
-        stage1 = hashlib.sha1(password).digest()
-        stage2 = hashlib.sha1(stage1).digest()
-        stage3 = hashlib.sha1(sbuffer+stage2).digest()
-        stage4 = ''.join(map(lambda (x, y): chr(ord(x) ^ ord(y)), zip(stage1, stage3)))
-        if stage4==cbuffer:
-            return True
-        else:
-            return False
-    except KeyError:
-        return False
 
 def get_struct_packet(pkt,sid_func=None):
     len2, len1 = divmod(len(pkt), 65536)
@@ -125,21 +132,6 @@ def make_hand_shake(sid_func=None):
     packet = version+thread_id+buffer_0+'\x00'+server_option+server_language+server_status+'\x00'*13+buffer_1+'\x00'
     return get_struct_packet(packet,sid_func=sid_func),sbuffer
 
-def make_struct_resultset(
-        column_list, dataset, 
-        database_name = '', table_name = '', origin_table_name = '', server_status = 0, charset = 8,
-        sid_func=None
-        ):
-    result=''
-    for v in make_struct_resultset_yield(
-            column_list, dataset, 
-            database_name = database_name, table_name = table_name, 
-            origin_table_name = origin_table_name, server_status = server_status, charset = charset,
-            sid_func=sid_func
-            ):
-        result+=v
-    return result
-
 def make_struct_resultset_yield(
         column_list, dataset, 
         database_name = '', table_name = '', origin_table_name = '', server_status = 0, charset = 8,
@@ -173,6 +165,21 @@ def make_struct_resultset_yield(
                 packet += get_encode_str(str(cell))
         yield get_struct_packet(packet,sid_func=sid_func)
     yield get_struct_packet(eofpacket,sid_func=sid_func)
+
+def make_struct_resultset(
+        column_list, dataset, 
+        database_name = '', table_name = '', origin_table_name = '', server_status = 0, charset = 8,
+        sid_func=None
+        ):
+    result=''
+    for v in make_struct_resultset_yield(
+            column_list, dataset, 
+            database_name = database_name, table_name = table_name, 
+            origin_table_name = origin_table_name, server_status = server_status, charset = charset,
+            sid_func=sid_func
+            ):
+        result+=v
+    return result
 
 def mysql_auth_check(data,sbuffer,aclmap=None,sid_func=None):
     client_option = struct.unpack("<I", data[:4])[0]
@@ -327,15 +334,23 @@ class MysqlBASE(object):
         self._acl=acl
     def get_acl(self):
         return self._acl
+    def set_option(self,aclmap=None,time_connect=None,time_active=None):
+        self.set_acl(aclmap)
+        self._time_connect=time_connect
+        self._time_active=time_active
 
+#gevent
 class GeventHandler(MysqlBASE):
     def process(self):
+        if getattr(self,'_time_active',None):
+            self.set_timeout(value=getattr(self,'_time_active',None))
+        timeout=getattr(self,'_time_connect',None) or 50
         if getattr(self,'buf',None) is None:
             self.buf = ""
         send_ver,sbuffer=make_hand_shake(sid_func=self.get_sid)
         self.send(send_ver)
         while True:
-            a=self.recv(timeout=50,buf=1024)
+            a=self.recv(timeout=timeout,buf=1024)
             if not a:
                 break
             self.buf += a
@@ -367,6 +382,7 @@ class GeventHandler(MysqlBASE):
                 self.query(cmdarg)
             else:
                 self.send(make_struct_simpleok(sid_func=self.get_sid))
+        print 'connnect close'
     def __init__(self,*args,**kwargs):
         self._timeout=kwargs.get('timeout')
         if self._timeout is None:
@@ -404,8 +420,19 @@ class GeventHandler(MysqlBASE):
                 result=None
         return result
 
-def start_server_gevent(host=None,port=None,func=None):
+class GeventFunc(object):
+    def __init__(self,aclmap=None,time_connect=None,time_active=None):
+        self._aclmap=aclmap
+        self._time_connect=time_connect
+        self._time_active=time_active
+    def __call__(self,s_socket, s_address):
+        r=GeventHandler(socket_handle=s_socket,socket_address=s_address)
+        r.set_option(aclmap=self._aclmap,time_connect=self._time_connect,time_active=self._time_active)
+        r.process()
+
+def gevent_start_server(host=None,port=None,aclmap=None,time_connect=None,time_active=None):
     from gevent.server import StreamServer
+    func=GeventFunc(aclmap=aclmap,time_connect=time_connect,time_active=time_active)
     f=StreamServer((host,int(port)), func)
     f.serve_forever()
 
@@ -422,14 +449,13 @@ def test1():
 ACL= {"testuser": ["testpass",{"myadd": add,'test1':test1}],
       "root":["rootpass",{}]
     }
-def application_func(s_socket, s_address):
-    r=GeventHandler(socket_handle=s_socket,socket_address=s_address)
-    r.set_acl(ACL)
-    r.process()
 def test_server():
-    from gevent.server import StreamServer
-    f=StreamServer((host,int(port)), application_func)
-    f.serve_forever()
+    host='127.0.0.1'
+    port=44444
+    gevent_start_server(
+        host=host,port=port,
+        aclmap=ACL,time_connect=None,time_active=None
+        )
 
 if __name__=='__main__':
     test_server()
